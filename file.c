@@ -129,6 +129,23 @@ next:
 	return path_resolved;
 }
 
+/* If "<phys>.gz" is a regular file, stat it into *s and return true.
+** phys is temporarily extended in place and always restored on return. */
+static bool uh_stat_gzip(char *phys, struct stat *s)
+{
+	size_t len = strlen(phys);
+	bool ok;
+
+	if (len + sizeof(".gz") > PATH_MAX)
+		return false;
+
+	memcpy(phys + len, ".gz", sizeof(".gz"));
+	ok = !stat(phys, s) && (s->st_mode & S_IFREG);
+	phys[len] = 0;
+
+	return ok;
+}
+
 /* Returns NULL on error.
 ** NB: improperly encoded URL should give client 400 [Bad Syntax]; returning
 ** NULL here causes 404 [Not Found], but that's not too unreasonable. */
@@ -203,11 +220,19 @@ uh_path_lookup(struct client *cl, const char *url)
 			continue;
 
 		/* test current path */
-		if (stat(path_phys, &p.stat))
-			continue;
+		if (stat(path_phys, &p.stat) == 0) {
+			snprintf(path_info, sizeof(path_info), "%s", uh_buf + i);
+			break;
+		}
 
-		snprintf(path_info, sizeof(path_info), "%s", uh_buf + i);
-		break;
+		/* fall back to a pre-compressed .gz variant for gzip clients */
+		if (cl->request.accept_gzip && uh_stat_gzip(path_phys, &p.stat)) {
+			snprintf(path_info, sizeof(path_info), "%s", uh_buf + i);
+			p.gzip = true;
+			break;
+		}
+
+		continue;
 	}
 
 	/* check whether found path is within docroot */
@@ -265,6 +290,13 @@ uh_path_lookup(struct client *cl, const char *url)
 		strcpy(pathptr, idx->name);
 		if (!stat(path_phys, &s) && (s.st_mode & S_IFREG)) {
 			memcpy(&p.stat, &s, sizeof(p.stat));
+			break;
+		}
+
+		/* prefer a pre-compressed index for gzip clients */
+		if (cl->request.accept_gzip && uh_stat_gzip(path_phys, &s)) {
+			memcpy(&p.stat, &s, sizeof(p.stat));
+			p.gzip = true;
 			break;
 		}
 
@@ -634,6 +666,11 @@ static void uh_file_data(struct client *cl, struct path_info *pi, int fd)
 	/* write status */
 	uh_file_response_200(cl, &pi->stat);
 
+	if (pi->gzip) {
+		ustream_printf(cl->us, "Content-Encoding: gzip\r\n");
+		ustream_printf(cl->us, "Vary: Accept-Encoding\r\n");
+	}
+
 	ustream_printf(cl->us, "Content-Type: %s\r\n",
 			   uh_file_mime_lookup(pi->name));
 
@@ -682,7 +719,26 @@ static void uh_file_request(struct client *cl, const char *url,
 		goto error;
 
 	if (pi->stat.st_mode & S_IFREG) {
-		fd = open(pi->phys, O_RDONLY);
+		char gzpath[PATH_MAX];
+		const char *openpath = pi->phys;
+
+		if (pi->gzip) {
+			/* only a pre-compressed variant exists on disk */
+			snprintf(gzpath, sizeof(gzpath), "%s.gz", pi->phys);
+			openpath = gzpath;
+		} else if (cl->request.accept_gzip) {
+			/* both variants exist: prefer the pre-compressed one */
+			struct stat gz;
+
+			snprintf(gzpath, sizeof(gzpath), "%s.gz", pi->phys);
+			if (!stat(gzpath, &gz) && (gz.st_mode & S_IFREG)) {
+				pi->stat = gz;
+				pi->gzip = true;
+				openpath = gzpath;
+			}
+		}
+
+		fd = open(openpath, O_RDONLY);
 		if (fd < 0)
 			goto error;
 

@@ -147,6 +147,7 @@ struct http_request {
 	bool expect_cont;
 	bool connection_close;
 	bool disable_chunked;
+	bool accept_gzip;
 	uint8_t transfer_chunked;
 	const struct auth_realm *realm;
 };
@@ -173,6 +174,7 @@ struct path_info {
 	const char *info;
 	const char *query;
 	bool redirected;
+	bool gzip;
 	struct stat stat;
 	const struct interpreter *ip;
 };
