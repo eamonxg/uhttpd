@@ -364,15 +364,18 @@ static void client_header_complete(struct client *cl)
 static bool uh_accept_gzip(const char *val)
 {
 	const char *p = val;
+	bool star = false;
 
 	/* Scan the comma-separated content-coding list for a "gzip" (or the
 	** equivalent "x-gzip") token that is not disabled with q=0. Coding
 	** names are matched case-insensitively and on token boundaries so a
-	** substring like "notgzip" does not falsely match (RFC 7231 5.3.4). */
+	** substring like "notgzip" does not falsely match. A "*" wildcard
+	** counts as gzip unless gzip is explicitly listed, in which case the
+	** explicit entry wins (RFC 7231 5.3.4). */
 	while (*p) {
 		const char *tok;
 		size_t tlen;
-		bool is_gzip;
+		bool is_gzip, is_star, ok = true;
 
 		while (*p == ',' || *p == ' ' || *p == '\t')
 			p++;
@@ -386,11 +389,12 @@ static bool uh_accept_gzip(const char *val)
 
 		is_gzip = (tlen == 4 && !strncasecmp(tok, "gzip", 4)) ||
 			  (tlen == 6 && !strncasecmp(tok, "x-gzip", 6));
+		is_star = (tlen == 1 && tok[0] == '*');
 
 		while (*p == ' ' || *p == '\t')
 			p++;
 
-		if (is_gzip && *p == ';') {
+		if ((is_gzip || is_star) && *p == ';') {
 			const char *q = p + 1;
 			size_t qlen;
 
@@ -400,18 +404,21 @@ static bool uh_accept_gzip(const char *val)
 				q += 2;
 				qlen = strcspn(q, " \t,;");
 				if (qlen && strspn(q, "0.") == qlen)
-					is_gzip = false;	/* q=0[.0...] */
+					ok = false;	/* q=0[.0...] */
 			}
 		}
 
 		if (is_gzip)
-			return true;
+			return ok;
+
+		if (is_star)
+			star = ok;
 
 		while (*p && *p != ',')
 			p++;
 	}
 
-	return false;
+	return star;
 }
 
 static void client_parse_header(struct client *cl, char *data)
@@ -498,7 +505,9 @@ static void client_parse_header(struct client *cl, char *data)
 		else if (strstr(val, "Konqueror"))
 			r->ua = UH_UA_KONQUEROR;
 	} else if (!strcmp(data, "accept-encoding")) {
-		r->accept_gzip = uh_accept_gzip(val);
+		/* multiple header lines are equivalent to one comma-joined
+		** list (RFC 9110 5.3): any line accepting gzip is enough */
+		r->accept_gzip |= uh_accept_gzip(val);
 	}
 
 

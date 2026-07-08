@@ -33,8 +33,9 @@ build_if_needed() {
 setup_docroot() { DOCROOT="$(mktemp -d)"; }
 
 # Launch uhttpd in the foreground (backgrounded here) against $DOCROOT.
+# Extra arguments are passed through to uhttpd (e.g. -S, -i, -x).
 launch() {
-	"$BIN" -f -p "$ADDR" -h "$DOCROOT" >/dev/null 2>&1 &
+	"$BIN" -f -p "$ADDR" -h "$DOCROOT" "$@" >/dev/null 2>&1 &
 	PID=$!
 	# wait for the port to accept connections
 	for _ in $(seq 1 50); do
@@ -59,8 +60,18 @@ hdr() { # hdr <url> <header-name> [extra curl args...]
 		| tr -d '\r' | awk -v h="$(printf '%s' "$name" | tr A-Z a-z)" \
 			'tolower($1)==h":"{ $1=""; sub(/^ /,""); print }'
 }
-status() { curl -s -o /dev/null -w '%{http_code}' "$@" "http://$ADDR/$1"; }
-bodylen() { curl -s "$@" "http://$ADDR/$1" | wc -c | tr -d ' '; }
+status() { # status <url> [extra curl args...]
+	local url="$1"; shift
+	curl -s -o /dev/null -w '%{http_code}' "$@" "http://$ADDR/$url"
+}
+bodylen() { # bodylen <url> [extra curl args...]
+	local url="$1"; shift
+	curl -s "$@" "http://$ADDR/$url" | wc -c | tr -d ' '
+}
+body() { # body <url> [extra curl args...]
+	local url="$1"; shift
+	curl -s "$@" "http://$ADDR/$url"
+}
 
 # ---- Test: only the original file exists → output unchanged, no encoding ----
 test_plain_only() {
@@ -204,6 +215,121 @@ test_conditional() {
 	stop_uhttpd
 }
 
+# ---- Test: -S (no_symlinks) must not follow a symlinked .gz variant ----
+test_no_symlinks_gz_symlink() {
+	setup_docroot
+	local outside ce blen code
+	outside="$(mktemp)"
+	printf 'SECRET-OUTSIDE-DOCROOT' > "$outside"
+	chmod 644 "$outside"
+	printf 'PLAIN' > "$DOCROOT/a.css"                # 5 bytes
+	ln -s "$outside" "$DOCROOT/a.css.gz"
+	launch -S
+
+	ce="$(hdr a.css Content-Encoding -H 'Accept-Encoding: gzip')"
+	blen="$(bodylen a.css -H 'Accept-Encoding: gzip')"
+	[ -z "$ce" ] && pass "noSymlinks: symlinked .gz not served as gzip" \
+	             || fail "noSymlinks: symlinked .gz served (Content-Encoding '$ce')"
+	[ "$blen" = "5" ] && pass "noSymlinks: gzip client falls back to plain body" \
+	                  || fail "noSymlinks: body length was '$blen' (expected 5)"
+
+	# without the plain file the lookup must fail, not leak the target
+	rm "$DOCROOT/a.css"
+	code="$(status a.css -H 'Accept-Encoding: gzip')"
+	[ "$code" = "404" ] && pass "noSymlinks: gz-only symlink → 404" \
+	                     || fail "noSymlinks: gz-only symlink got $code"
+
+	stop_uhttpd
+	rm -f "$outside"
+}
+
+# ---- Test: -S with a regular .gz file only (no symlinks involved) ----
+test_no_symlinks_gz_only() {
+	setup_docroot
+	printf 'GZDATA' > "$DOCROOT/a.css.gz"
+	launch -S
+
+	local code ce
+	code="$(status a.css -H 'Accept-Encoding: gzip')"
+	ce="$(hdr a.css Content-Encoding -H 'Accept-Encoding: gzip')"
+	[ "$code" = "200" ] && pass "noSymlinks: gz-only regular file → 200" \
+	                     || fail "noSymlinks: gz-only got $code"
+	[ "$ce" = "gzip" ] && pass "noSymlinks: gz-only Content-Encoding gzip" \
+	                    || fail "noSymlinks: Content-Encoding '$ce'"
+	stop_uhttpd
+}
+
+# ---- Test: the .gz fallback must never feed CGI/interpreter dispatch ----
+test_script_no_gz_fallback() {
+	setup_docroot
+	printf 'FAKE' > "$DOCROOT/foo.php.gz"
+	mkdir -p "$DOCROOT/cgi-bin"
+	printf 'FAKE' > "$DOCROOT/cgi-bin/prog.gz"
+	launch -i .php=/bin/sh -x /cgi-bin
+
+	local code_php code_cgi
+	code_php="$(status foo.php -H 'Accept-Encoding: gzip')"
+	code_cgi="$(status cgi-bin/prog -H 'Accept-Encoding: gzip')"
+	[ "$code_php" = "404" ] && pass "script: interpreter path with only .gz → 404" \
+	                         || fail "script: foo.php got $code_php (expected 404)"
+	[ "$code_cgi" = "404" ] && pass "script: cgi-bin path with only .gz → 404" \
+	                         || fail "script: cgi-bin/prog got $code_cgi (expected 404)"
+	stop_uhttpd
+}
+
+# ---- Test: multiple Accept-Encoding headers accumulate (RFC 9110 5.3) ----
+test_multi_ae_headers() {
+	setup_docroot
+	printf 'GZ' > "$DOCROOT/a.css.gz"
+	launch
+
+	local c1 c2
+	c1="$(status a.css -H 'Accept-Encoding: br' -H 'Accept-Encoding: gzip')"
+	c2="$(status a.css -H 'Accept-Encoding: gzip' -H 'Accept-Encoding: br')"
+	[ "$c1" = "200" ] && pass "multiAE: gzip in second header honored" \
+	                  || fail "multiAE: br,gzip got $c1"
+	[ "$c2" = "200" ] && pass "multiAE: gzip in first header survives later headers" \
+	                  || fail "multiAE: gzip,br got $c2"
+	stop_uhttpd
+}
+
+# ---- Test: Accept-Encoding: * wildcard (RFC 7231 5.3.4) ----
+test_star() {
+	setup_docroot
+	printf 'GZ' > "$DOCROOT/a.css.gz"
+	launch
+
+	local c_star c_star_q0 c_explicit_q0
+	c_star="$(status a.css -H 'Accept-Encoding: *')"
+	c_star_q0="$(status a.css -H 'Accept-Encoding: *;q=0')"
+	c_explicit_q0="$(status a.css -H 'Accept-Encoding: gzip;q=0, *')"
+	[ "$c_star" = "200" ] && pass "star: * accepts gzip" \
+	                       || fail "star: * got $c_star"
+	[ "$c_star_q0" = "404" ] && pass "star: *;q=0 not acceptable" \
+	                          || fail "star: *;q=0 got $c_star_q0"
+	[ "$c_explicit_q0" = "404" ] && pass "star: explicit gzip;q=0 beats *" \
+	                              || fail "star: 'gzip;q=0, *' got $c_explicit_q0"
+	stop_uhttpd
+}
+
+# ---- Test: plain response carries Vary when a .gz sibling exists ----
+test_vary_plain() {
+	setup_docroot
+	printf 'PLAINDATA' > "$DOCROOT/a.css"
+	printf 'GZ' > "$DOCROOT/a.css.gz"
+	printf 'ONLY' > "$DOCROOT/b.css"
+	launch
+
+	local vary_both vary_only
+	vary_both="$(hdr a.css Vary)"                       # non-gzip client
+	vary_only="$(hdr b.css Vary)"
+	case "$vary_both" in *Accept-Encoding*) pass "vary: plain response advertises Vary" ;;
+	                     *) fail "vary: plain response Vary was '$vary_both'" ;; esac
+	[ -z "$vary_only" ] && pass "vary: no .gz sibling → no Vary" \
+	                    || fail "vary: unexpected Vary '$vary_only'"
+	stop_uhttpd
+}
+
 build_if_needed
 test_plain_only
 test_gz_only
@@ -212,6 +338,12 @@ test_q0
 test_both
 test_index_gz
 test_conditional
+test_no_symlinks_gz_symlink
+test_no_symlinks_gz_only
+test_script_no_gz_fallback
+test_multi_ae_headers
+test_star
+test_vary_plain
 
 log "----"
 [ "$FAILS" -eq 0 ] && { log "ALL PASS"; exit 0; } || { log "$FAILS failure(s)"; exit 1; }
