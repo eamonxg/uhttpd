@@ -147,6 +147,7 @@ struct http_request {
 	bool expect_cont;
 	bool connection_close;
 	bool disable_chunked;
+	bool accept_gzip;
 	uint8_t transfer_chunked;
 	const struct auth_realm *realm;
 };
