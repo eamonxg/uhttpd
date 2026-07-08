@@ -96,6 +96,7 @@ struct config {
 	int ubus_cors;
 	int cgi_prefix_len;
 	int events_retry;
+	int gzip_level;
 	struct list_head cgi_alias;
 	struct list_head lua_prefix;
 #ifdef HAVE_UCODE
@@ -260,6 +261,9 @@ struct dispatch {
 		struct {
 			struct blob_attr **hdr;
 			int fd;
+#ifdef HAVE_ZLIB
+			void *gz;
+#endif
 		} file;
 		struct dispatch_proc proc;
 #ifdef HAVE_UBUS

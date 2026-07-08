@@ -176,6 +176,9 @@ static int usage(const char *name)
 		"	-d string       URL decode given string\n"
 		"	-r string       Specify basic auth realm\n"
 		"	-m string       MD5 crypt given string\n"
+#ifdef HAVE_ZLIB
+		"	-z level        Enable gzip compression of static files (level 1-9, 0=off)\n"
+#endif
 		"\n", name
 	);
 	return 1;
@@ -293,7 +296,7 @@ int main(int argc, char **argv)
 	init_defaults_pre();
 	signal(SIGPIPE, SIG_IGN);
 
-	while ((ch = getopt(argc, argv, "A:ab:C:c:Dd:E:e:fh:H:I:i:K:k:L:l:m:N:n:O:o:P:p:qRr:Ss:T:t:U:u:Xx:y:")) != -1) {
+	while ((ch = getopt(argc, argv, "A:ab:C:c:Dd:E:e:fh:H:I:i:K:k:L:l:m:N:n:O:o:P:p:qRr:Ss:T:t:U:u:Xx:y:z:")) != -1) {
 		switch(ch) {
 #ifdef HAVE_TLS
 		case 'C':
@@ -472,6 +475,21 @@ int main(int argc, char **argv)
 			printf("%s\n", crypt(optarg, "$1$"));
 			return 0;
 			break;
+
+#ifdef HAVE_ZLIB
+		case 'z':
+			conf.gzip_level = atoi(optarg);
+			if (conf.gzip_level < 0 || conf.gzip_level > 9) {
+				fprintf(stderr, "Error: Invalid gzip level: %s\n", optarg);
+				exit(1);
+			}
+			break;
+#else
+		case 'z':
+			fprintf(stderr, "uhttpd: gzip support not compiled, "
+			                "ignoring -z\n");
+			break;
+#endif
 
 		/* config file */
 		case 'c':
