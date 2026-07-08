@@ -129,6 +129,51 @@ next:
 	return path_resolved;
 }
 
+/* Look for a pre-compressed "<base[0..baselen)>.gz" sibling.
+**
+** The .gz candidate is run through canonpath() (which is realpath() under
+** -S) and checked for docroot containment exactly like a plain file, so a
+** symlinked .gz cannot escape the docroot and a gz-only layout still
+** resolves even when the plain file is absent. On success *s is filled
+** from the .gz file and the *logical* (.gz-stripped) canonical path is
+** written to out; the caller keeps using that .gz-free name for
+** Content-Type, auth and ETag. Returns false (fail closed) on any error. */
+static bool uh_stat_gzip(const char *base, size_t baselen, char *out,
+			 struct stat *s)
+{
+	char gz[PATH_MAX];
+	char res[PATH_MAX];
+	int docroot_len = strlen(conf.docroot);
+	size_t rlen;
+
+	if (baselen + sizeof(".gz") > sizeof(gz))
+		return false;
+
+	memcpy(gz, base, baselen);
+	memcpy(gz + baselen, ".gz", sizeof(".gz"));
+
+	if (!canonpath(gz, res))
+		return false;
+
+	/* keep the resolved path within the docroot */
+	if (strncmp(res, conf.docroot, docroot_len) != 0 ||
+	    (res[docroot_len] != 0 && res[docroot_len] != '/'))
+		return false;
+
+	if (stat(res, s) != 0 || !(s->st_mode & S_IFREG))
+		return false;
+
+	/* strip the trailing .gz to recover the logical name */
+	rlen = strlen(res);
+	if (rlen < sizeof(".gz") - 1 || strcmp(res + rlen - 3, ".gz") != 0)
+		return false;
+
+	memcpy(out, res, rlen - 3);
+	out[rlen - 3] = 0;
+
+	return true;
+}
+
 /* Returns NULL on error.
 ** NB: improperly encoded URL should give client 400 [Bad Syntax]; returning
 ** NULL here causes 404 [Not Found], but that's not too unreasonable. */
@@ -199,15 +244,24 @@ uh_path_lookup(struct client *cl, const char *url)
 		exists = !!canonpath(uh_buf, path_phys);
 		uh_buf[i] = ch;
 
-		if (!exists)
-			continue;
-
 		/* test current path */
-		if (stat(path_phys, &p.stat))
-			continue;
+		if (exists && stat(path_phys, &p.stat) == 0) {
+			snprintf(path_info, sizeof(path_info), "%s", uh_buf + i);
+			break;
+		}
 
-		snprintf(path_info, sizeof(path_info), "%s", uh_buf + i);
-		break;
+		/* fall back to a pre-compressed .gz variant for gzip clients.
+		** uh_stat_gzip() canonicalizes the .gz candidate itself, so this
+		** also covers gz-only layouts under -S, where canonpath() of the
+		** missing plain file above fails. */
+		if (cl->request.accept_gzip &&
+		    uh_stat_gzip(uh_buf, i, path_phys, &p.stat)) {
+			snprintf(path_info, sizeof(path_info), "%s", uh_buf + i);
+			p.gzip = true;
+			break;
+		}
+
+		continue;
 	}
 
 	/* check whether found path is within docroot */
@@ -265,6 +319,14 @@ uh_path_lookup(struct client *cl, const char *url)
 		strcpy(pathptr, idx->name);
 		if (!stat(path_phys, &s) && (s.st_mode & S_IFREG)) {
 			memcpy(&p.stat, &s, sizeof(p.stat));
+			break;
+		}
+
+		/* prefer a pre-compressed index for gzip clients */
+		if (cl->request.accept_gzip &&
+		    uh_stat_gzip(path_phys, strlen(path_phys), path_phys, &s)) {
+			memcpy(&p.stat, &s, sizeof(p.stat));
+			p.gzip = true;
 			break;
 		}
 
@@ -634,6 +696,12 @@ static void uh_file_data(struct client *cl, struct path_info *pi, int fd)
 	/* write status */
 	uh_file_response_200(cl, &pi->stat);
 
+	if (pi->gzip)
+		ustream_printf(cl->us, "Content-Encoding: gzip\r\n");
+
+	if (pi->vary)
+		ustream_printf(cl->us, "Vary: Accept-Encoding\r\n");
+
 	ustream_printf(cl->us, "Content-Type: %s\r\n",
 			   uh_file_mime_lookup(pi->name));
 
@@ -682,7 +750,34 @@ static void uh_file_request(struct client *cl, const char *url,
 		goto error;
 
 	if (pi->stat.st_mode & S_IFREG) {
-		fd = open(pi->phys, O_RDONLY);
+		char gzpath[PATH_MAX];
+		const char *openpath = pi->phys;
+
+		if (pi->gzip) {
+			/* only a pre-compressed variant exists on disk */
+			snprintf(gzpath, sizeof(gzpath), "%s.gz", pi->phys);
+			openpath = gzpath;
+			pi->vary = true;
+		} else {
+			/* a plain file exists; check for a .gz sibling both to
+			** prefer it for gzip clients and to advertise Vary so
+			** shared caches keep the two variants apart */
+			struct stat gz;
+			char logical[PATH_MAX];
+
+			if (uh_stat_gzip(pi->phys, strlen(pi->phys), logical, &gz)) {
+				pi->vary = true;
+				if (cl->request.accept_gzip) {
+					pi->stat = gz;
+					pi->gzip = true;
+					snprintf(gzpath, sizeof(gzpath), "%s.gz",
+						 pi->phys);
+					openpath = gzpath;
+				}
+			}
+		}
+
+		fd = open(openpath, O_RDONLY);
 		if (fd < 0)
 			goto error;
 
@@ -907,9 +1002,17 @@ static bool __handle_file_request(struct client *cl, char *url, bool is_error_ha
 	}
 
 	d = dispatch_find(url, pi);
-	if (d)
+	if (d) {
+		/* A pre-compressed .gz variant is a static artifact, never a
+		** script to execute; letting it reach CGI/interpreter dispatch
+		** would exec a nonexistent plain file. Restore the plain 404. */
+		if (pi->gzip) {
+			uh_client_error(cl, 404, "Not Found",
+					"No such file or directory");
+			return true;
+		}
 		uh_invoke_handler(cl, d, url, pi);
-	else
+	} else
 		uh_file_request(cl, url, pi, tb);
 
 	return true;
