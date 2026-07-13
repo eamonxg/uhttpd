@@ -66,10 +66,14 @@ jobs:
           # 5) 运行期依赖加 zlib(gzip 需要 libz)
           sed -i '/libcrypt-compat/ s/$/ +zlib/' Makefile
 
-          # 6) Build/Prepare 用本地 ./src 覆盖默认下载;插件全关、只留 zlib
-          #    这是"只测 gzip"的精简二进制:gzip 在核心 file.c 里,独立实例 -z 即可验证,
-          #    用不到 ubus/ucode/lua/tls,关掉它们避免相关 staging/依赖带来的编译风险。
-          printf '\ndefine Build/Prepare\n\tmkdir -p $(PKG_BUILD_DIR)\n\t$(CP) ./src/. $(PKG_BUILD_DIR)/\nendef\n\nCMAKE_OPTIONS += -DLUA_SUPPORT=OFF -DTLS_SUPPORT=OFF -DUBUS_SUPPORT=OFF -DUCODE_SUPPORT=OFF -DZLIB_SUPPORT=ON\n' >> Makefile
+          # 6a) Build/Prepare 用本地 ./src 覆盖默认下载(override 型 define 放末尾可生效)
+          printf '\ndefine Build/Prepare\n\tmkdir -p $(PKG_BUILD_DIR)\n\t$(CP) ./src/. $(PKG_BUILD_DIR)/\nendef\n' >> Makefile
+
+          # 6b) 插件全关、只留 zlib。这是"只测 gzip"的精简二进制:gzip 在核心 file.c 里,
+          #     独立实例 -z 即可验证,用不到 ubus/ucode/lua/tls(且 SDK 未必带它们的 staging)。
+          #     注意:CMAKE_OPTIONS 必须插在 `include cmake.mk` 之后的常规位置;
+          #     追加到 Makefile 末尾(BuildPackage 之后)不会生效 —— 上一轮就栽在这。
+          awk '{print} /cmake\.mk/{print "CMAKE_OPTIONS += -DLUA_SUPPORT=OFF -DTLS_SUPPORT=OFF -DUBUS_SUPPORT=OFF -DUCODE_SUPPORT=OFF -DZLIB_SUPPORT=ON"}' Makefile > Makefile.new && mv Makefile.new Makefile
 
           echo "================ 生成的 Makefile ================"
           cat Makefile
