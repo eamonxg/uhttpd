@@ -66,9 +66,10 @@ jobs:
           # 5) 运行期依赖加 zlib(gzip 需要 libz)
           sed -i '/libcrypt-compat/ s/$/ +zlib/' Makefile
 
-          # 6) Build/Prepare 用本地 ./src 覆盖默认下载;并只编 ubus/ucode/zlib,关 lua/tls
-          #    (lua/tls 的 staging 在 SDK 里未必有;gzip 与二者无关。ZLIB_SUPPORT 本就默认 ON,显式再写一遍更保险)
-          printf '\ndefine Build/Prepare\n\tmkdir -p $(PKG_BUILD_DIR)\n\t$(CP) ./src/. $(PKG_BUILD_DIR)/\nendef\n\nCMAKE_OPTIONS += -DLUA_SUPPORT=OFF -DTLS_SUPPORT=OFF -DUBUS_SUPPORT=ON -DUCODE_SUPPORT=ON -DZLIB_SUPPORT=ON\n' >> Makefile
+          # 6) Build/Prepare 用本地 ./src 覆盖默认下载;插件全关、只留 zlib
+          #    这是"只测 gzip"的精简二进制:gzip 在核心 file.c 里,独立实例 -z 即可验证,
+          #    用不到 ubus/ucode/lua/tls,关掉它们避免相关 staging/依赖带来的编译风险。
+          printf '\ndefine Build/Prepare\n\tmkdir -p $(PKG_BUILD_DIR)\n\t$(CP) ./src/. $(PKG_BUILD_DIR)/\nendef\n\nCMAKE_OPTIONS += -DLUA_SUPPORT=OFF -DTLS_SUPPORT=OFF -DUBUS_SUPPORT=OFF -DUCODE_SUPPORT=OFF -DZLIB_SUPPORT=ON\n' >> Makefile
 
           echo "================ 生成的 Makefile ================"
           cat Makefile
@@ -79,8 +80,9 @@ jobs:
           ARCH: ${{ matrix.arch }}
           FEEDNAME: gzipfork
           FEED_DIR: ${{ github.workspace }}/feed
-          # 一起编:核心二进制 + 你用到的插件,保证和二进制同源、ABI 一致
-          PACKAGES: uhttpd uhttpd-mod-ubus uhttpd-mod-ucode
+          # 只填源码包名(子包 mod-* 没有独立包目录,不能进这个列表)。
+          # 精简构建下只产出核心 uhttpd 包,足够做 gzip 测试。
+          PACKAGES: uhttpd
           NO_REFRESH_CHECK: 1
           NO_SHFMT_CHECK: 1
           V: s
