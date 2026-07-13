@@ -66,6 +66,10 @@ jobs:
           # 5) 运行期依赖加 zlib(gzip 需要 libz)
           sed -i '/libcrypt-compat/ s/$/ +zlib/' Makefile
 
+          # 5b) 精简构建只出核心 uhttpd 包:移除 mod-* 子包的注册。
+          #     插件已关、不会生成 uhttpd_*.so,若还注册子包,打包会因缺 .so 失败。
+          sed -i '/BuildPackage,uhttpd-mod-/d' Makefile
+
           # 6a) Build/Prepare 用本地 ./src 覆盖默认下载(override 型 define 放末尾可生效)
           printf '\ndefine Build/Prepare\n\tmkdir -p $(PKG_BUILD_DIR)\n\t$(CP) ./src/. $(PKG_BUILD_DIR)/\nendef\n' >> Makefile
 
