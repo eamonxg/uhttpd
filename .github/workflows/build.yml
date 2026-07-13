@@ -42,35 +42,33 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: 组装 uhttpd 配方(取自 OpenWrt ${{ env.OPENWRT_REF }},源码指向本仓库当前提交)
+      - name: 组装 uhttpd 配方(配方取自 OpenWrt ${{ env.OPENWRT_REF }},源码用本仓库 checkout)
         run: |
           set -e
+          # 1) 从 OpenWrt 拉 uhttpd 打包配方(Makefile + files/,含 init/config/ubus.default)
           git clone --depth 1 -b "$OPENWRT_REF" https://github.com/openwrt/openwrt.git /tmp/owrt
           mkdir -p feed/uhttpd
           cp -a /tmp/owrt/package/network/services/uhttpd/. feed/uhttpd/
-          cd feed/uhttpd
 
-          # 1) 去掉上游的源码锁定与 TLS 构建依赖(TLS 下面关掉,避免 SDK 缺 ustream-ssl staging)
+          # 2) 把本仓库 checkout 的源码放进配方目录,直接本地编译
+          #    —— 不走 PKG_SOURCE 下载,就没有哈希校验(gh-action-sdk 的 check 不接受 skip)
+          #    —— 也天然对得上任意分支:编的就是触发本次构建的这份代码
+          mkdir -p feed/uhttpd/src
+          tar -cf - --exclude=./.git --exclude=./.github --exclude=./feed . | tar -xf - -C feed/uhttpd/src
+
+          cd feed/uhttpd
+          # 3) 去掉上游的下载/哈希/TLS 构建依赖(TLS 下面关掉,避免 SDK 缺 ustream-ssl staging)
           sed -i '/^PKG_SOURCE/d; /^PKG_MIRROR_HASH/d; /^PKG_BUILD_DEPENDS/d' Makefile
 
-          # 2) 源码改为本仓库触发本次构建的提交 —— 任何分支都对得上,无需写死分支
-          awk -v repo="$GITHUB_REPOSITORY" -v sha="$GITHUB_SHA" '
-            /^PKG_RELEASE:=/{
-              print
-              print "PKG_VERSION:=1-gzip"
-              print "PKG_SOURCE_PROTO:=git"
-              print "PKG_SOURCE_URL:=https://github.com/" repo ".git"
-              print "PKG_SOURCE_VERSION:=" sha
-              print "PKG_MIRROR_HASH:=skip"
-              next
-            }1' Makefile > Makefile.new && mv Makefile.new Makefile
+          # 4) 设定包版本
+          awk '/^PKG_RELEASE:=/{print; print "PKG_VERSION:=1-gzip"; next}1' Makefile > Makefile.new && mv Makefile.new Makefile
 
-          # 3) 运行期依赖加 zlib(gzip 需要 libz)
+          # 5) 运行期依赖加 zlib(gzip 需要 libz)
           sed -i '/libcrypt-compat/ s/$/ +zlib/' Makefile
 
-          # 4) 只编要打包的:开 ubus/ucode/zlib,关 lua/tls
-          #    (lua/tls 的 staging 在 SDK 里未必有;gzip 与二者无关。ZLIB_SUPPORT 本就默认 ON,显式写一遍更保险)
-          printf '\nCMAKE_OPTIONS += -DLUA_SUPPORT=OFF -DTLS_SUPPORT=OFF -DUBUS_SUPPORT=ON -DUCODE_SUPPORT=ON -DZLIB_SUPPORT=ON\n' >> Makefile
+          # 6) Build/Prepare 用本地 ./src 覆盖默认下载;并只编 ubus/ucode/zlib,关 lua/tls
+          #    (lua/tls 的 staging 在 SDK 里未必有;gzip 与二者无关。ZLIB_SUPPORT 本就默认 ON,显式再写一遍更保险)
+          printf '\ndefine Build/Prepare\n\tmkdir -p $(PKG_BUILD_DIR)\n\t$(CP) ./src/. $(PKG_BUILD_DIR)/\nendef\n\nCMAKE_OPTIONS += -DLUA_SUPPORT=OFF -DTLS_SUPPORT=OFF -DUBUS_SUPPORT=ON -DUCODE_SUPPORT=ON -DZLIB_SUPPORT=ON\n' >> Makefile
 
           echo "================ 生成的 Makefile ================"
           cat Makefile
