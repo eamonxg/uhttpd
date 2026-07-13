@@ -34,6 +34,10 @@
 
 #include <libubox/blobmsg.h>
 
+#ifdef HAVE_ZLIB
+#include <zlib.h>
+#endif
+
 #include "uhttpd.h"
 #include "mimetypes.h"
 
@@ -299,10 +303,113 @@ static const char * uh_file_mime_lookup(const char *path)
 	return "application/octet-stream";
 }
 
-static const char * uh_file_mktag(struct stat *s, char *buf, int len)
+#ifdef HAVE_ZLIB
+/* zlib deflate memory usage is roughly
+** (1 << (windowBits+2)) + (1 << (memLevel+9)) bytes, so 13/6 keeps every
+** stream at ~70KB (the defaults 15/8 would take ~262KB) at a small ratio
+** cost for typical text assets. */
+#define UH_GZIP_WBITS       13
+#define UH_GZIP_MEMLEVEL    6
+#define UH_GZIP_MIN_SIZE    256
+#define UH_GZIP_MAX_STREAMS 16
+
+static int uh_gzip_streams;
+
+static bool uh_gzip_mime_ok(const char *mime)
 {
-	snprintf(buf, len, "\"%" PRIx64 "-%" PRIx64 "-%" PRIx64 "\"",
-	         s->st_ino, s->st_size, (uint64_t)s->st_mtime);
+	size_t len = strlen(mime);
+
+	if (!strncmp(mime, "text/", 5))
+		return true;
+
+	if (!strcmp(mime, "application/json") ||
+	    !strcmp(mime, "application/xml"))
+		return true;
+
+	if ((len > 4 && !strcmp(mime + len - 4, "+xml")) ||
+	    (len > 5 && !strcmp(mime + len - 5, "+json")))
+		return true;
+
+	return false;
+}
+
+/* Decide whether the response may be gzipped and set up the deflate
+** stream; any failure falls back to the plain identity path. */
+static bool uh_gzip_start(struct client *cl, struct path_info *pi)
+{
+	z_stream *strm;
+
+	if (conf.gzip_level < 1 || !cl->request.accept_gzip)
+		return false;
+
+	if (cl->request.version != UH_HTTP_VER_1_1 ||
+	    cl->request.method != UH_HTTP_MSG_GET)
+		return false;
+
+	if (pi->stat.st_size < UH_GZIP_MIN_SIZE)
+		return false;
+
+	if (!uh_gzip_mime_ok(uh_file_mime_lookup(pi->name)))
+		return false;
+
+	if (uh_gzip_streams >= UH_GZIP_MAX_STREAMS)
+		return false;
+
+	strm = calloc(1, sizeof(*strm));
+	if (!strm)
+		return false;
+
+	/* windowBits + 16: emit a gzip wrapper instead of a zlib one */
+	if (deflateInit2(strm, conf.gzip_level, Z_DEFLATED, UH_GZIP_WBITS + 16,
+	                 UH_GZIP_MEMLEVEL, Z_DEFAULT_STRATEGY) != Z_OK) {
+		free(strm);
+		return false;
+	}
+
+	uh_gzip_streams++;
+	cl->dispatch.file.gz = strm;
+
+	return true;
+}
+
+static void uh_gzip_end(struct client *cl)
+{
+	z_stream *strm = cl->dispatch.file.gz;
+
+	if (!strm)
+		return;
+
+	deflateEnd(strm);
+	free(strm);
+	cl->dispatch.file.gz = NULL;
+	uh_gzip_streams--;
+}
+
+static bool uh_file_gz_active(struct client *cl)
+{
+	return cl->dispatch.file.gz != NULL;
+}
+#else
+static bool uh_gzip_start(struct client *cl, struct path_info *pi)
+{
+	return false;
+}
+
+static void uh_gzip_end(struct client *cl)
+{
+}
+
+static bool uh_file_gz_active(struct client *cl)
+{
+	return false;
+}
+#endif
+
+static const char * uh_file_mktag(struct client *cl, struct stat *s, char *buf, int len)
+{
+	snprintf(buf, len, "\"%" PRIx64 "-%" PRIx64 "-%" PRIx64 "%s\"",
+	         s->st_ino, s->st_size, (uint64_t)s->st_mtime,
+	         uh_file_gz_active(cl) ? "-gz" : "");
 
 	return buf;
 }
@@ -341,7 +448,7 @@ static void uh_file_response_ok_hdrs(struct client *cl, struct stat *s)
 	char buf[128];
 
 	if (s) {
-		ustream_printf(cl->us, "ETag: %s\r\n", uh_file_mktag(s, buf, sizeof(buf)));
+		ustream_printf(cl->us, "ETag: %s\r\n", uh_file_mktag(cl, s, buf, sizeof(buf)));
 		ustream_printf(cl->us, "Last-Modified: %s\r\n",
 			       uh_file_unix2date(s->st_mtime, buf, sizeof(buf)));
 	}
@@ -375,7 +482,7 @@ static void uh_file_response_412(struct client *cl)
 static bool uh_file_if_match(struct client *cl, struct stat *s)
 {
 	char buf[128];
-	const char *tag = uh_file_mktag(s, buf, sizeof(buf));
+	const char *tag = uh_file_mktag(cl, s, buf, sizeof(buf));
 	char *hdr = uh_file_header(cl, HDR_IF_MATCH);
 	int hlen, i;
 	char *p;
@@ -422,7 +529,7 @@ static int uh_file_if_modified_since(struct client *cl, struct stat *s)
 static int uh_file_if_none_match(struct client *cl, struct stat *s)
 {
 	char buf[128];
-	const char *tag = uh_file_mktag(s, buf, sizeof(buf));
+	const char *tag = uh_file_mktag(cl, s, buf, sizeof(buf));
 	char *hdr = uh_file_header(cl, HDR_IF_NONE_MATCH);
 	int hlen, i;
 	char *p;
@@ -611,13 +718,60 @@ static void file_write_cb(struct client *cl)
 	}
 }
 
+#ifdef HAVE_ZLIB
+static void file_gzip_write_cb(struct client *cl)
+{
+	z_stream *strm = cl->dispatch.file.gz;
+	int fd = cl->dispatch.file.fd;
+	unsigned char out[4096];
+	int flush, r, len;
+
+	while (cl->us->w.data_bytes < 256) {
+		r = read(fd, uh_buf, sizeof(uh_buf));
+		if (r < 0) {
+			if (errno == EINTR)
+				continue;
+
+			uh_request_done(cl);
+			return;
+		}
+
+		flush = r ? Z_NO_FLUSH : Z_FINISH;
+		strm->next_in = (unsigned char *)uh_buf;
+		strm->avail_in = r;
+
+		do {
+			strm->next_out = out;
+			strm->avail_out = sizeof(out);
+
+			if (deflate(strm, flush) == Z_STREAM_ERROR) {
+				uh_request_done(cl);
+				return;
+			}
+
+			len = sizeof(out) - strm->avail_out;
+			if (len)
+				uh_chunk_write(cl, out, len);
+		} while (strm->avail_out == 0);
+
+		if (flush == Z_FINISH) {
+			uh_request_done(cl);
+			return;
+		}
+	}
+}
+#endif
+
 static void uh_file_free(struct client *cl)
 {
 	close(cl->dispatch.file.fd);
+	uh_gzip_end(cl);
 }
 
 static void uh_file_data(struct client *cl, struct path_info *pi, int fd)
 {
+	const char *mime = uh_file_mime_lookup(pi->name);
+
 	/* test preconditions */
 	if (!cl->dispatch.no_cache &&
 	    (!uh_file_if_modified_since(cl, &pi->stat) ||
@@ -625,6 +779,7 @@ static void uh_file_data(struct client *cl, struct path_info *pi, int fd)
 	     !uh_file_if_range(cl, &pi->stat) ||
 	     !uh_file_if_unmodified_since(cl, &pi->stat) ||
 	     !uh_file_if_none_match(cl, &pi->stat))) {
+		uh_gzip_end(cl);
 		ustream_printf(cl->us, "\r\n");
 		uh_request_done(cl);
 		close(fd);
@@ -634,9 +789,16 @@ static void uh_file_data(struct client *cl, struct path_info *pi, int fd)
 	/* write status */
 	uh_file_response_200(cl, &pi->stat);
 
-	ustream_printf(cl->us, "Content-Type: %s\r\n",
-			   uh_file_mime_lookup(pi->name));
+	ustream_printf(cl->us, "Content-Type: %s\r\n", mime);
 
+#ifdef HAVE_ZLIB
+	if (conf.gzip_level > 0 && uh_gzip_mime_ok(mime))
+		ustream_printf(cl->us, "Vary: Accept-Encoding\r\n");
+
+	if (uh_file_gz_active(cl))
+		ustream_printf(cl->us, "Content-Encoding: gzip\r\n\r\n");
+	else
+#endif
 	ustream_printf(cl->us, "Content-Length: %" PRIu64 "\r\n\r\n",
 			   pi->stat.st_size);
 
@@ -649,9 +811,16 @@ static void uh_file_data(struct client *cl, struct path_info *pi, int fd)
 	}
 
 	cl->dispatch.file.fd = fd;
-	cl->dispatch.write_cb = file_write_cb;
 	cl->dispatch.free = uh_file_free;
 	cl->dispatch.close_fds = uh_file_free;
+#ifdef HAVE_ZLIB
+	if (uh_file_gz_active(cl)) {
+		cl->dispatch.write_cb = file_gzip_write_cb;
+		file_gzip_write_cb(cl);
+		return;
+	}
+#endif
+	cl->dispatch.write_cb = file_write_cb;
 	file_write_cb(cl);
 }
 
@@ -686,7 +855,8 @@ static void uh_file_request(struct client *cl, const char *url,
 		if (fd < 0)
 			goto error;
 
-		req->disable_chunked = true;
+		if (!uh_gzip_start(cl, pi))
+			req->disable_chunked = true;
 		cl->dispatch.file.hdr = tb;
 		uh_file_data(cl, pi, fd);
 		cl->dispatch.file.hdr = NULL;

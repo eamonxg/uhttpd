@@ -96,6 +96,7 @@ struct config {
 	int ubus_cors;
 	int cgi_prefix_len;
 	int events_retry;
+	int gzip_level;
 	struct list_head cgi_alias;
 	struct list_head lua_prefix;
 #ifdef HAVE_UCODE
@@ -147,6 +148,7 @@ struct http_request {
 	bool expect_cont;
 	bool connection_close;
 	bool disable_chunked;
+	bool accept_gzip;
 	uint8_t transfer_chunked;
 	const struct auth_realm *realm;
 };
@@ -259,6 +261,9 @@ struct dispatch {
 		struct {
 			struct blob_attr **hdr;
 			int fd;
+#ifdef HAVE_ZLIB
+			void *gz;
+#endif
 		} file;
 		struct dispatch_proc proc;
 #ifdef HAVE_UBUS

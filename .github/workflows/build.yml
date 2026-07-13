@@ -1,0 +1,103 @@
+name: build-uhttpd
+
+# 用 OpenWrt 官方 SDK 交叉编译本仓库改动过的 uhttpd,产出可安装的 ipk/apk。
+# 思路:CI 里从 OpenWrt 源码拉 uhttpd 的打包配方(Makefile + files/),
+#      把它的源码改成"本仓库触发本次构建的那个提交",再交给 gh-action-sdk 编。
+# 好处:配方/init 脚本不用进本仓库;push 哪个分支就编哪个分支,零维护。
+
+on:
+  push:
+    branches:
+      - master
+      - 'feat/**'          # 覆盖 feat/gzip-runtime、feat/gzip-static 及以后所有 feat/*
+  workflow_dispatch:
+    inputs:
+      openwrt_ref:
+        description: 'uhttpd 配方来源(OpenWrt 源码分支/标签)。默认 main;针对发行版填 openwrt-23.05 等'
+        default: 'main'
+
+env:
+  # 默认对着 OpenWrt 主分支(main)。手动触发可用上面的 openwrt_ref 覆盖。
+  OPENWRT_REF: ${{ github.event.inputs.openwrt_ref || 'main' }}
+
+jobs:
+  build:
+    name: ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 改成你路由的 DISTRIB_ARCH(路由上 `cat /etc/openwrt_release` 查)。
+        # 不带版本号 = 跟随 OpenWrt SNAPSHOT(与 main 对应,产物为 .apk)。
+        # 要针对发行版:把上面的 openwrt_ref 设为 openwrt-23.05,并给下面 arch
+        # 加版本后缀,如 mipsel_24kc-23.05.5(产物为 .ipk)。
+        arch:
+          - x86_64
+          - mipsel_24kc
+          - aarch64_cortex-a53
+
+    steps:
+      - name: Checkout(本仓库改动源码)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 组装 uhttpd 配方(配方取自 OpenWrt ${{ env.OPENWRT_REF }},源码用本仓库 checkout)
+        run: |
+          set -e
+          # 1) 从 OpenWrt 拉 uhttpd 打包配方(Makefile + files/,含 init/config/ubus.default)
+          git clone --depth 1 -b "$OPENWRT_REF" https://github.com/openwrt/openwrt.git /tmp/owrt
+          mkdir -p feed/uhttpd
+          cp -a /tmp/owrt/package/network/services/uhttpd/. feed/uhttpd/
+
+          # 2) 把本仓库 checkout 的源码放进配方目录,直接本地编译
+          #    —— 不走 PKG_SOURCE 下载,就没有哈希校验(gh-action-sdk 的 check 不接受 skip)
+          #    —— 也天然对得上任意分支:编的就是触发本次构建的这份代码
+          mkdir -p feed/uhttpd/src
+          tar -cf - --exclude=./.git --exclude=./.github --exclude=./feed . | tar -xf - -C feed/uhttpd/src
+
+          cd feed/uhttpd
+          # 3) 去掉上游的下载/哈希/TLS 构建依赖(TLS 下面关掉,避免 SDK 缺 ustream-ssl staging)
+          sed -i '/^PKG_SOURCE/d; /^PKG_MIRROR_HASH/d; /^PKG_BUILD_DEPENDS/d' Makefile
+
+          # 4) 设定包版本(必须是合法版本号:apk 不接受 `1-gzip` 里的 -gzip)
+          awk '/^PKG_RELEASE:=/{print; print "PKG_VERSION:=1.0"; next}1' Makefile > Makefile.new && mv Makefile.new Makefile
+
+          # 5) 运行期依赖加 zlib(gzip 需要 libz)
+          sed -i '/libcrypt-compat/ s/$/ +zlib/' Makefile
+
+          # 5b) 精简构建只出核心 uhttpd 包:移除 mod-* 子包的注册。
+          #     插件已关、不会生成 uhttpd_*.so,若还注册子包,打包会因缺 .so 失败。
+          sed -i '/BuildPackage,uhttpd-mod-/d' Makefile
+
+          # 6a) Build/Prepare 用本地 ./src 覆盖默认下载(override 型 define 放末尾可生效)
+          printf '\ndefine Build/Prepare\n\tmkdir -p $(PKG_BUILD_DIR)\n\t$(CP) ./src/. $(PKG_BUILD_DIR)/\nendef\n' >> Makefile
+
+          # 6b) 插件全关、只留 zlib。这是"只测 gzip"的精简二进制:gzip 在核心 file.c 里,
+          #     独立实例 -z 即可验证,用不到 ubus/ucode/lua/tls(且 SDK 未必带它们的 staging)。
+          #     注意:CMAKE_OPTIONS 必须插在 `include cmake.mk` 之后的常规位置;
+          #     追加到 Makefile 末尾(BuildPackage 之后)不会生效 —— 上一轮就栽在这。
+          awk '{print} /cmake\.mk/{print "CMAKE_OPTIONS += -DLUA_SUPPORT=OFF -DTLS_SUPPORT=OFF -DUBUS_SUPPORT=OFF -DUCODE_SUPPORT=OFF -DZLIB_SUPPORT=ON"}' Makefile > Makefile.new && mv Makefile.new Makefile
+
+          echo "================ 生成的 Makefile ================"
+          cat Makefile
+
+      - name: 交叉编译(OpenWrt SDK)
+        uses: openwrt/gh-action-sdk@main
+        env:
+          ARCH: ${{ matrix.arch }}
+          FEEDNAME: gzipfork
+          FEED_DIR: ${{ github.workspace }}/feed
+          # 只填源码包名(子包 mod-* 没有独立包目录,不能进这个列表)。
+          # 精简构建下只产出核心 uhttpd 包,足够做 gzip 测试。
+          PACKAGES: uhttpd
+          NO_REFRESH_CHECK: 1
+          NO_SHFMT_CHECK: 1
+          V: s
+
+      - name: 上传安装包
+        uses: actions/upload-artifact@v4
+        with:
+          name: uhttpd-${{ matrix.arch }}
+          path: bin/packages/*/gzipfork/uhttpd*
+          if-no-files-found: error
